@@ -1,0 +1,14 @@
+# Ignore compiled binaries
+ecies_test
+*.o
+*.exe
+
+# Ignore VS Code settings
+.vscode/
+
+# Ignore Profiling Data
+callgrind.out.*
+*.log
+
+# OS generated files
+.DS_Store
