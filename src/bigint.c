@@ -5,12 +5,6 @@
 // --- CONSTANTS ---
 static const uint64_t SECP256K1_K_LOW = 0x1000003D1ULL; 
 
-// P = 2^256 - 0x1000003D1
-// In limbs (Little Endian order for calculation):
-// Limbs[0] = 0xFFFFFFFEFFFFFC2F
-// Limbs[1] = 0xFFFFFFFFFFFFFFFF
-// Limbs[2] = 0xFFFFFFFFFFFFFFFF
-// Limbs[3] = 0xFFFFFFFFFFFFFFFF
 static const bigint256_t SECP256K1_P = {{
     0xFFFFFFFEFFFFFC2FULL, 
     0xFFFFFFFFFFFFFFFFULL, 
@@ -92,42 +86,56 @@ void bigint_mul(bigint512_t *res, const bigint256_t *a, const bigint256_t *b) {
     }
 }
 
-// --- MODULAR OPERATIONS ---
+// --- OPTIMIZED MODULAR OPERATIONS ---
 
-// Internal helper to check if a >= b
 static int bigint_ge(const bigint256_t *a, const bigint256_t *b) {
     for (int i = NUM_LIMBS - 1; i >= 0; i--) {
         if (a->limbs[i] > b->limbs[i]) return 1;
         if (a->limbs[i] < b->limbs[i]) return 0;
     }
-    return 1; // Equal
+    return 1;
 }
 
 void bigint_mod_p(bigint256_t *dest, const bigint512_t *src) {
     bigint512_t temp = *src;
     int safety_ctr = 0;
 
-    // 1. Fold the top 256 bits down (Lazy Reduction)
+    // Fold the top 256 bits down (Lazy Reduction)
     while ((temp.limbs[4] || temp.limbs[5] || temp.limbs[6] || temp.limbs[7]) && safety_ctr < 20) {
         safety_ctr++;
-        for (int i = 4; i < 8; i++) {
-            limb_t val = temp.limbs[i];
-            if (val == 0) continue;
-            temp.limbs[i] = 0;
+        
+        limb_t hi[4];
+        hi[0] = temp.limbs[4]; hi[1] = temp.limbs[5]; hi[2] = temp.limbs[6]; hi[3] = temp.limbs[7];
+        temp.limbs[4] = 0; temp.limbs[5] = 0; temp.limbs[6] = 0; temp.limbs[7] = 0;
+
+        limb_t carry = 0;
+        for (int i = 0; i < 4; i++) {
+            dlimb_t product = (dlimb_t)hi[i] * SECP256K1_K_LOW;
+            dlimb_t sum = (dlimb_t)temp.limbs[i] + product + carry;
+            temp.limbs[i] = (limb_t)sum;
+            carry = (limb_t)(sum >> 64);
+        }
+        temp.limbs[4] = carry;
+
+        // Fold the overflow in limb[4] if it exists
+        if (temp.limbs[4] != 0) {
+            limb_t val = temp.limbs[4];
+            temp.limbs[4] = 0;
             dlimb_t product = (dlimb_t)val * SECP256K1_K_LOW;
+            
             limb_t lo = (limb_t)product;
-            limb_t hi = (limb_t)(product >> 64);
-            int pos = i - 4;
-            dlimb_t sum = (dlimb_t)temp.limbs[pos] + lo;
-            temp.limbs[pos] = (limb_t)sum;
-            limb_t carry = (limb_t)(sum >> 64);
-            if (pos + 1 < 8) {
-                sum = (dlimb_t)temp.limbs[pos + 1] + hi + carry;
-                temp.limbs[pos + 1] = (limb_t)sum;
-                carry = (limb_t)(sum >> 64);
-            }
-            int k = pos + 2;
-            while (carry > 0 && k < 8) {
+            limb_t hi_part = (limb_t)(product >> 64);
+
+            dlimb_t sum = (dlimb_t)temp.limbs[0] + lo;
+            temp.limbs[0] = (limb_t)sum;
+            carry = (limb_t)(sum >> 64);
+
+            sum = (dlimb_t)temp.limbs[1] + hi_part + carry;
+            temp.limbs[1] = (limb_t)sum;
+            carry = (limb_t)(sum >> 64);
+
+            int k = 2;
+            while (carry > 0 && k < 4) {
                 sum = (dlimb_t)temp.limbs[k] + carry;
                 temp.limbs[k] = (limb_t)sum;
                 carry = (limb_t)(sum >> 64);
@@ -136,35 +144,107 @@ void bigint_mod_p(bigint256_t *dest, const bigint512_t *src) {
         }
     }
 
-    // 2. Extract the lower 256 bits
     for (int i = 0; i < 4; i++) dest->limbs[i] = temp.limbs[i];
-
-    // 3. Strict Check: If result >= P, subtract P
-    while (bigint_ge(dest, &SECP256K1_P)) {
+    int loop_limit = 0;
+    while (bigint_ge(dest, &SECP256K1_P) && loop_limit < 5) {
         bigint_sub(dest, dest, &SECP256K1_P);
+        loop_limit++;
     }
 }
 
+// --- OPTIMIZED INVERSION (Fully Inlined Binary GCD) ---
+static int bigint_is_zero(const bigint256_t *a) {
+    return (a->limbs[0] | a->limbs[1] | a->limbs[2] | a->limbs[3]) == 0;
+}
+
 void bigint_inv_mod_p(bigint256_t *dest, const bigint256_t *src) {
-    bigint256_t p_minus_2;
-    bigint_set_hex(&p_minus_2, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D");
+    if (bigint_is_zero(src)) { memset(dest, 0, sizeof(bigint256_t)); return; }
 
-    bigint256_t res;
-    bigint_set_hex(&res, "1");
-    
-    bigint256_t base = *src;
-    bigint512_t temp_mul;
+    bigint256_t u = *src;
+    bigint256_t v = SECP256K1_P;
+    bigint256_t x1, x2;
+    memset(&x1, 0, sizeof(bigint256_t)); x1.limbs[0] = 1;
+    memset(&x2, 0, sizeof(bigint256_t));
 
-    for (int i = 255; i >= 0; i--) {
-        bigint_mul(&temp_mul, &res, &res);
-        bigint_mod_p(&res, &temp_mul);
+    // We process until u or v is 0. 
+    // Inlining shifts and adds to remove function call overhead.
+    while (!bigint_is_zero(&u) && !bigint_is_zero(&v)) {
+        
+        // 1. Shift u while even
+        while ((u.limbs[0] & 1) == 0) {
+            // u = u >> 1
+            limb_t carry = 0;
+            // Unrolled loop for 4 limbs
+            limb_t n3 = (u.limbs[3] & 1) << 63; u.limbs[3] = (u.limbs[3] >> 1) | carry; carry = n3;
+            limb_t n2 = (u.limbs[2] & 1) << 63; u.limbs[2] = (u.limbs[2] >> 1) | carry; carry = n2;
+            limb_t n1 = (u.limbs[1] & 1) << 63; u.limbs[1] = (u.limbs[1] >> 1) | carry; carry = n1;
+            /* n0 */                            u.limbs[0] = (u.limbs[0] >> 1) | carry;
 
-        int limb_idx = i / 64;
-        int bit_idx  = i % 64;
-        if ((p_minus_2.limbs[limb_idx] >> bit_idx) & 1) {
-            bigint_mul(&temp_mul, &res, &base);
-            bigint_mod_p(&res, &temp_mul);
+            // If x1 even: x1 = x1 >> 1
+            if ((x1.limbs[0] & 1) == 0) {
+                carry = 0;
+                n3 = (x1.limbs[3] & 1) << 63; x1.limbs[3] = (x1.limbs[3] >> 1) | carry; carry = n3;
+                n2 = (x1.limbs[2] & 1) << 63; x1.limbs[2] = (x1.limbs[2] >> 1) | carry; carry = n2;
+                n1 = (x1.limbs[1] & 1) << 63; x1.limbs[1] = (x1.limbs[1] >> 1) | carry; carry = n1;
+                                              x1.limbs[0] = (x1.limbs[0] >> 1) | carry;
+            } else {
+                // x1 = (x1 + P) >> 1
+                limb_t add_carry = 0;
+                // Inline Add P
+                dlimb_t sum = (dlimb_t)x1.limbs[0] + SECP256K1_P.limbs[0]; x1.limbs[0] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x1.limbs[1] + SECP256K1_P.limbs[1] + add_carry; x1.limbs[1] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x1.limbs[2] + SECP256K1_P.limbs[2] + add_carry; x1.limbs[2] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x1.limbs[3] + SECP256K1_P.limbs[3] + add_carry; x1.limbs[3] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                
+                // Now Shift
+                carry = add_carry << 63; // The overflow bit from addition becomes MSB
+                n3 = (x1.limbs[3] & 1) << 63; x1.limbs[3] = (x1.limbs[3] >> 1) | carry; carry = n3;
+                n2 = (x1.limbs[2] & 1) << 63; x1.limbs[2] = (x1.limbs[2] >> 1) | carry; carry = n2;
+                n1 = (x1.limbs[1] & 1) << 63; x1.limbs[1] = (x1.limbs[1] >> 1) | carry; carry = n1;
+                                              x1.limbs[0] = (x1.limbs[0] >> 1) | carry;
+            }
+        }
+
+        // 2. Shift v while even
+        while ((v.limbs[0] & 1) == 0) {
+            // v = v >> 1
+            limb_t carry = 0;
+            limb_t n3 = (v.limbs[3] & 1) << 63; v.limbs[3] = (v.limbs[3] >> 1) | carry; carry = n3;
+            limb_t n2 = (v.limbs[2] & 1) << 63; v.limbs[2] = (v.limbs[2] >> 1) | carry; carry = n2;
+            limb_t n1 = (v.limbs[1] & 1) << 63; v.limbs[1] = (v.limbs[1] >> 1) | carry; carry = n1;
+                                                v.limbs[0] = (v.limbs[0] >> 1) | carry;
+
+            if ((x2.limbs[0] & 1) == 0) {
+                carry = 0;
+                n3 = (x2.limbs[3] & 1) << 63; x2.limbs[3] = (x2.limbs[3] >> 1) | carry; carry = n3;
+                n2 = (x2.limbs[2] & 1) << 63; x2.limbs[2] = (x2.limbs[2] >> 1) | carry; carry = n2;
+                n1 = (x2.limbs[1] & 1) << 63; x2.limbs[1] = (x2.limbs[1] >> 1) | carry; carry = n1;
+                                              x2.limbs[0] = (x2.limbs[0] >> 1) | carry;
+            } else {
+                limb_t add_carry = 0;
+                dlimb_t sum = (dlimb_t)x2.limbs[0] + SECP256K1_P.limbs[0]; x2.limbs[0] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x2.limbs[1] + SECP256K1_P.limbs[1] + add_carry; x2.limbs[1] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x2.limbs[2] + SECP256K1_P.limbs[2] + add_carry; x2.limbs[2] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                sum = (dlimb_t)x2.limbs[3] + SECP256K1_P.limbs[3] + add_carry; x2.limbs[3] = (limb_t)sum; add_carry = (limb_t)(sum >> 64);
+                
+                carry = add_carry << 63;
+                n3 = (x2.limbs[3] & 1) << 63; x2.limbs[3] = (x2.limbs[3] >> 1) | carry; carry = n3;
+                n2 = (x2.limbs[2] & 1) << 63; x2.limbs[2] = (x2.limbs[2] >> 1) | carry; carry = n2;
+                n1 = (x2.limbs[1] & 1) << 63; x2.limbs[1] = (x2.limbs[1] >> 1) | carry; carry = n1;
+                                              x2.limbs[0] = (x2.limbs[0] >> 1) | carry;
+            }
+        }
+
+        // 3. Subtract
+        if (bigint_ge(&u, &v)) {
+            bigint_sub(&u, &u, &v);
+            if (bigint_sub(&x1, &x1, &x2)) bigint_add(&x1, &x1, &SECP256K1_P);
+        } else {
+            bigint_sub(&v, &v, &u);
+            if (bigint_sub(&x2, &x2, &x1)) bigint_add(&x2, &x2, &SECP256K1_P);
         }
     }
-    *dest = res;
+
+    if (bigint_is_zero(&v)) *dest = x1;
+    else *dest = x2;
 }
